@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dino Dash</title>
+<style>
+  :root{
+    --panel: #2a1c14;
+    --accent: #ffb03b;
+    --text: #fff6e6;
+  }
+  *{ box-sizing: border-box; }
+  html,body{
+    margin:0; padding:0; height:100%;
+    background:#1b120c;
+    font-family: 'Trebuchet MS', 'Segoe UI', Arial, sans-serif;
+    display:flex; align-items:center; justify-content:center;
+    overflow:hidden;
+    touch-action:none;
+  }
+  #stage{
+    position:relative;
+    width:960px; height:600px;
+    max-width:100vw; max-height:100vh;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+    border-radius:10px;
+    overflow:hidden;
+    background:#000;
+  }
+  canvas{
+    display:block;
+    width:100%; height:100%;
+    image-rendering: optimizeSpeed;
+  }
+  #hint{
+    position:absolute;
+    bottom:8px; left:50%; transform:translateX(-50%);
+    color: rgba(255,246,230,0.55);
+    font-size:12px;
+    letter-spacing:0.5px;
+    pointer-events:none;
+    user-select:none;
+  }
+  /* on-screen d-pad for touch devices */
+  #touchpad{
+    position:absolute;
+    right:20px; bottom:20px;
+    width:150px; height:150px;
+    display:none;
+    z-index:5;
+  }
+  #touchpad.show{ display:block; }
+  .tbtn{
+    position:absolute;
+    width:50px; height:50px;
+    background:rgba(255,246,230,0.18);
+    border:2px solid rgba(255,246,230,0.35);
+    border-radius:10px;
+    display:flex; align-items:center; justify-content:center;
+    color:#fff6e6; font-size:20px;
+    user-select:none;
+    -webkit-user-select:none;
+  }
+  .tbtn:active{ background:rgba(255,176,59,0.5); }
+  #tb-up{ top:0; left:50px; }
+  #tb-down{ top:100px; left:50px; }
+  #tb-left{ top:50px; left:0; }
+  #tb-right{ top:50px; left:100px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="game" width="960" height="600"></canvas>
+  <div id="hint">Arrow Keys / WASD to move &nbsp;•&nbsp; Space to start / restart &nbsp;•&nbsp; Esc to pause</div>
+  <div id="touchpad">
+    <div class="tbtn" id="tb-up">&#9650;</div>
+    <div class="tbtn" id="tb-down">&#9660;</div>
+    <div class="tbtn" id="tb-left">&#9664;</div>
+    <div class="tbtn" id="tb-right">&#9654;</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ============================================================================
+   DINO DASH — single-file browser game (HTML5 Canvas + vanilla JS)
+
+   A hungry little dinosaur runs through a scrolling prehistoric world.
+   Chase food for points, dodge obstacles, survive as the world speeds up.
+
+   CODE MAP
+     1. CONSTANTS & CANVAS SETUP
+     2. UTILITIES (text, math, high-score persistence)
+     3. BACKGROUND / PARALLAX
+     4. PARTICLES
+     5. PLAYER
+     6. FOOD
+     7. OBSTACLES
+     8. HUD
+     9. SCREENS (start / game over)
+     10. GAME (state machine + main loop)
+     11. INPUT WIRING
+============================================================================ */
+
+// ---------------------------------------------------------------------------
+// 1. CONSTANTS & CANVAS SETUP
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+const W = canvas.width;
+const H = canvas.height;
+
+// Player is confined to a "play zone" so the world can scroll past it.
+const PLAY_ZONE = { left: 40, top: 40, right: 40 + Math.floor(W * 0.55), bottom: H - 40 - 90 };
+const GROUND_Y = H - 90;
+
+// Difficulty tuning
+const BASE_SCROLL_SPEED = 220;
+const MAX_SCROLL_SPEED = 620;
+const SCROLL_SPEED_PER_SCORE = 0.9;
+
+const BASE_FOOD_INTERVAL = 1.15;
+const MIN_FOOD_INTERVAL = 0.45;
+const BASE_OBSTACLE_INTERVAL = 1.7;
+const MIN_OBSTACLE_INTERVAL = 0.55;
+
+const PLAYER_SPEED = 320;
+const PLAYER_START_LIVES = 3;
+const INVULNERABLE_TIME = 1.4;
+const KNOCKBACK_BURST = -46 * 6;
+
+// Palette
+const COL = {
+  skyTop: [255, 201, 124],
+  skyBottom: [255, 235, 190],
+  sun: "#ffe996",
+  mountainFar: "#d6966e",
+  hill: "#89a85c",
+  ground: "#a98558",
+  groundDark: "#926f46",
+  groundStripe: "#9c784c",
+  playerBody: "#56a85c",
+  playerBodyDark: "#3f8847",
+  playerBelly: "#c4e09c",
+  white: "#ffffff",
+  black: "#1e1814",
+  panel: "rgba(40,28,20,0.72)",
+  text: "#fff6e6",
+  accent: "#ffb03b",
+  heart: "#dc4646",
+  heartEmpty: "#5a4638",
+};
+
+const STATE_START = "start";
+const STATE_PLAYING = "playing";
+const STATE_GAMEOVER = "gameover";
+
+// ---------------------------------------------------------------------------
+// 2. UTILITIES
+// ---------------------------------------------------------------------------
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function lerpColor(c1, c2, t) {
+  return `rgb(${Math.round(lerp(c1[0], c2[0], t))},${Math.round(lerp(c1[1], c2[1], t))},${Math.round(lerp(c1[2], c2[2], t))})`;
+}
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+const HIGH_SCORE_KEY = "dinoDashHighScore";
+function loadHighScore() {
+  try {
+    const v = parseInt(localStorage.getItem(HIGH_SCORE_KEY), 10);
+    return isNaN(v) ? 0 : v;
+  } catch (e) { return 0; }
+}
+function saveHighScore(score) {
+  try { localStorage.setItem(HIGH_SCORE_KEY, String(Math.floor(score))); }
+  catch (e) { /* ignore (e.g. storage disabled) */ }
+}
+
+function drawText(text, size, color, x, y, opts = {}) {
+  const { align = "center", bold = false, shadow = true, baseline = "middle" } = opts;
+  ctx.font = `${bold ? "bold " : ""}${size}px 'Trebuchet MS', Arial, sans-serif`;
+  ctx.textAlign = align === "topleft" ? "left" : align;
+  ctx.textBaseline = align === "topleft" ? "top" : baseline;
+  if (shadow) {
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.fillText(text, x + 2, y + 3);
+  }
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y);
+}
+
+function randRange(a, b) { return a + Math.random() * (b - a); }
+function choiceWeighted(items, weights) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < items.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return items[i];
+  }
+  return items[items.length - 1];
+}
+
+// ---------------------------------------------------------------------------
+// 3. BACKGROUND / PARALLAX
+// ---------------------------------------------------------------------------
+class ParallaxLayer {
+  constructor(points, color, yBase, speedFactor, tileWidth) {
+    this.points = points; // [[x,h], ...] one tile silhouette
+    this.color = color;
+    this.yBase = yBase;
+    this.speedFactor = speedFactor;
+    this.tileWidth = tileWidth;
+    this.offset = 0;
+  }
+  update(dt, scrollSpeed) {
+    this.offset = (this.offset + scrollSpeed * this.speedFactor * dt) % this.tileWidth;
+  }
+  draw() {
+    const startX = -this.offset - this.tileWidth;
+    ctx.fillStyle = this.color;
+    for (let x = startX; x < W + this.tileWidth; x += this.tileWidth) {
+      ctx.beginPath();
+      ctx.moveTo(x + this.points[0][0], this.yBase - this.points[0][1]);
+      for (let i = 1; i < this.points.length; i++) {
+        ctx.lineTo(x + this.points[i][0], this.yBase - this.points[i][1]);
+      }
+      ctx.lineTo(x + this.tileWidth, this.yBase);
+      ctx.lineTo(x, this.yBase);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+}
+
+class Background {
+  constructor() {
+    this.mountains = new ParallaxLayer(
+      [[0, 70], [90, 130], [180, 60], [260, 150], [340, 80]],
+      COL.mountainFar, GROUND_Y - 10, 0.15, 340
+    );
+    this.hills = new ParallaxLayer(
+      [[0, 40], [70, 90], [150, 40], [230, 100], [300, 50]],
+      COL.hill, GROUND_Y + 6, 0.35, 300
+    );
+    this.groundOffset = 0;
+    this.clouds = [];
+    for (let i = 0; i < 5; i++) {
+      this.clouds.push({
+        x: randRange(0, W), y: randRange(30, 140),
+        scale: randRange(0.6, 1.3), speed: randRange(8, 22),
+      });
+    }
+  }
+  update(dt, scrollSpeed) {
+    this.mountains.update(dt, scrollSpeed);
+    this.hills.update(dt, scrollSpeed);
+    this.groundOffset = (this.groundOffset + scrollSpeed * dt) % 40;
+    for (const c of this.clouds) {
+      c.x -= c.speed * dt;
+      if (c.x < -80) { c.x = W + 80; c.y = randRange(30, 140); }
+    }
+  }
+  drawSky() {
+    const grad = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+    grad.addColorStop(0, `rgb(${COL.skyTop.join(",")})`);
+    grad.addColorStop(1, `rgb(${COL.skyBottom.join(",")})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, GROUND_Y);
+    ctx.fillStyle = COL.sun;
+    ctx.beginPath();
+    ctx.arc(W - 110, 90, 46, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  drawClouds() {
+    ctx.fillStyle = COL.white;
+    for (const c of this.clouds) {
+      const { x, y, scale: s } = c;
+      const puffs = [[0, 0, 18], [18, -8, 14], [-18, -6, 14], [34, 2, 12]];
+      for (const [dx, dy, r] of puffs) {
+        ctx.beginPath();
+        ctx.arc(x + dx * s, y + dy * s, r * s, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+  drawGround() {
+    ctx.fillStyle = COL.ground;
+    ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+    ctx.fillStyle = COL.groundDark;
+    ctx.fillRect(0, GROUND_Y, W, 8);
+    ctx.fillStyle = COL.groundStripe;
+    const stripeW = 26;
+    for (let x = -this.groundOffset; x < W; x += stripeW + 14) {
+      ctx.fillRect(x, GROUND_Y + 20, 14, H - GROUND_Y - 30);
+    }
+  }
+  draw() {
+    this.drawSky();
+    this.drawClouds();
+    this.mountains.draw();
+    this.hills.draw();
+    this.drawGround();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. PARTICLES
+// ---------------------------------------------------------------------------
+class Particle {
+  constructor(x, y, color, life = 0.5, radius = 5, speedRange = [60, 160]) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = randRange(speedRange[0], speedRange[1]);
+    this.vx = Math.cos(angle) * speed;
+    this.vy = Math.sin(angle) * speed;
+    this.x = x; this.y = y;
+    this.color = color;
+    this.life = life; this.maxLife = life;
+    this.radius = radius;
+  }
+  update(dt) {
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    this.vy += 220 * dt;
+    this.life -= dt;
+  }
+  draw() {
+    if (this.life <= 0) return;
+    const t = clamp(this.life / this.maxLife, 0, 1);
+    const r = Math.max(1, this.radius * t);
+    ctx.globalAlpha = t;
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  isDead() { return this.life <= 0; }
+}
+
+function spawnBurst(list, x, y, color, count = 14) {
+  for (let i = 0; i < count; i++) list.push(new Particle(x, y, color));
+}
+
+// ---------------------------------------------------------------------------
+// 5. PLAYER
+// ---------------------------------------------------------------------------
+class Player {
+  constructor() {
+    this.WIDTH = 64; this.HEIGHT = 54;
+    this.reset();
+  }
+  reset() {
+    this.x = PLAY_ZONE.left + 60;
+    this.y = (PLAY_ZONE.top + PLAY_ZONE.bottom) / 2;
+    this.facing = 1;
+    this.animTime = 0;
+    this.isMoving = false;
+    this.invulnTimer = 0;
+    this.knockbackVx = 0;
+  }
+  getRect() {
+    return { x: this.x - (this.WIDTH - 14) / 2, y: this.y - (this.HEIGHT - 10) / 2, w: this.WIDTH - 14, h: this.HEIGHT - 10 };
+  }
+  hit() {
+    this.invulnTimer = INVULNERABLE_TIME;
+    this.knockbackVx = KNOCKBACK_BURST;
+  }
+  get isInvulnerable() { return this.invulnTimer > 0; }
+
+  handleInput(keys, dt) {
+    let dx = 0, dy = 0;
+    if (keys.has("ArrowLeft") || keys.has("KeyA")) dx -= 1;
+    if (keys.has("ArrowRight") || keys.has("KeyD")) dx += 1;
+    if (keys.has("ArrowUp") || keys.has("KeyW")) dy -= 1;
+    if (keys.has("ArrowDown") || keys.has("KeyS")) dy += 1;
+
+    this.isMoving = (dx !== 0 || dy !== 0);
+    if (dx !== 0 && dy !== 0) { dx *= 0.7071; dy *= 0.7071; }
+    if (dx !== 0) this.facing = dx > 0 ? 1 : -1;
+
+    this.x += dx * PLAYER_SPEED * dt;
+    this.y += dy * PLAYER_SPEED * dt;
+
+    this.x = clamp(this.x, PLAY_ZONE.left + this.WIDTH / 2, PLAY_ZONE.right - this.WIDTH / 2);
+    this.y = clamp(this.y, PLAY_ZONE.top + this.HEIGHT / 2, PLAY_ZONE.bottom - this.HEIGHT / 2);
+  }
+  update(dt) {
+    this.animTime += dt;
+    if (this.invulnTimer > 0) this.invulnTimer -= dt;
+    if (Math.abs(this.knockbackVx) > 1) {
+      this.x += this.knockbackVx * dt;
+      this.knockbackVx *= 0.9;
+      this.x = clamp(this.x, PLAY_ZONE.left + this.WIDTH / 2, PLAY_ZONE.right - this.WIDTH / 2);
+    } else {
+      this.knockbackVx = 0;
+    }
+  }
+  draw() {
+    if (this.isInvulnerable && Math.floor(this.animTime * 14) % 2 === 0) return;
+
+    const bob = Math.sin(this.animTime * (this.isMoving ? 10 : 3)) * (this.isMoving ? 5 : 2);
+    const legSwing = this.isMoving ? Math.sin(this.animTime * 16) * 12 : 0;
+    const cx = this.x, cy = this.y + bob, f = this.facing;
+
+    // Legs
+    ctx.strokeStyle = COL.playerBodyDark;
+    ctx.lineWidth = 7; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(cx - 8 * f, cy + 14); ctx.lineTo(cx - 8 * f + legSwing, cy + 30); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx + 8 * f, cy + 14); ctx.lineTo(cx + 8 * f - legSwing, cy + 30); ctx.stroke();
+
+    // Tail
+    const tailWag = Math.sin(this.animTime * 10) * 6;
+    ctx.fillStyle = COL.playerBody;
+    ctx.beginPath();
+    ctx.moveTo(cx - 26 * f, cy - 4 + tailWag);
+    ctx.lineTo(cx - 44 * f, cy - 12 + tailWag);
+    ctx.lineTo(cx - 26 * f, cy + 8);
+    ctx.closePath(); ctx.fill();
+
+    // Body
+    ctx.fillStyle = COL.playerBody;
+    ellipse(cx, cy, 26, 17);
+    ctx.fillStyle = COL.playerBelly;
+    ellipse(cx, cy + 8, 17, 9);
+
+    // Head
+    const headX = cx + 26 * f, headY = cy - 14;
+    ctx.fillStyle = COL.playerBody;
+    circle(headX, headY, 15);
+    ellipse(headX + 12 * f, headY + 4, 10, 7);
+    ctx.fillStyle = COL.black;
+    circle(headX + 6 * f, headY - 4, 3);
+
+    // Spikes
+    ctx.fillStyle = COL.playerBodyDark;
+    for (const sx of [-6, 4, 14]) {
+      ctx.beginPath();
+      ctx.moveTo(cx + sx * f, cy - 16);
+      ctx.lineTo(cx + sx * f - 5 * f, cy - 6);
+      ctx.lineTo(cx + sx * f + 5 * f, cy - 6);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+}
+
+function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+function ellipse(x, y, rx, ry) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2); ctx.fill(); }
+
+// ---------------------------------------------------------------------------
+// 6. FOOD
+// ---------------------------------------------------------------------------
+// kind -> [points, color, radius, weight]
+const FOOD_TYPES = {
+  berry: [10, "#c43c5a", 9, 55],
+  egg:   [25, "#f0e1be", 12, 30],
+  meat:  [50, "#c86e46", 13, 12],
+  gem:   [100, "#6ec8e6", 11, 3],
+};
+
+class Food {
+  constructor() {
+    const kinds = Object.keys(FOOD_TYPES);
+    const weights = kinds.map(k => FOOD_TYPES[k][3]);
+    this.kind = choiceWeighted(kinds, weights);
+    const [points, color, radius] = FOOD_TYPES[this.kind];
+    this.points = points; this.color = color; this.radius = radius;
+    this.x = W + radius + randRange(0, 60);
+    this.y = randRange(PLAY_ZONE.top + 20, PLAY_ZONE.bottom - 20);
+    this.bobPhase = randRange(0, Math.PI * 2);
+    this.t = 0;
+  }
+  update(dt, scrollSpeed) { this.x -= scrollSpeed * dt; this.t += dt; }
+  getRect() {
+    const bob = Math.sin(this.t * 4 + this.bobPhase) * 4;
+    return { x: this.x - this.radius, y: this.y + bob - this.radius, w: this.radius * 2, h: this.radius * 2 };
+  }
+  offScreen() { return this.x < -this.radius * 2; }
+  draw() {
+    const bob = Math.sin(this.t * 4 + this.bobPhase) * 4;
+    const px = this.x, py = this.y + bob;
+    if (this.kind === "berry") {
+      ctx.fillStyle = this.color; circle(px, py, this.radius);
+      ctx.strokeStyle = "#8c1e37"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(px, py, this.radius, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = "#5a8c46"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(px, py - this.radius); ctx.lineTo(px + 4, py - this.radius - 6); ctx.stroke();
+    } else if (this.kind === "egg") {
+      ctx.fillStyle = this.color;
+      ctx.save(); ctx.translate(px, py); ctx.scale(1.6, 2.1);
+      ctx.beginPath(); ctx.arc(0, 0, this.radius / 2, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+      ctx.fillStyle = "#d2b482";
+      for (const [sx, sy] of [[-3, -4], [4, 2], [-2, 6]]) circle(px + sx, py + sy, 2);
+    } else if (this.kind === "meat") {
+      ctx.fillStyle = this.color;
+      ellipse(px, py, this.radius, this.radius * 0.8);
+      ctx.fillStyle = "#ebebe1";
+      ctx.fillRect(px - 3, py - this.radius, 6, this.radius * 1.6);
+    } else { // gem
+      ctx.fillStyle = this.color;
+      ctx.beginPath();
+      ctx.moveTo(px, py - this.radius); ctx.lineTo(px + this.radius, py);
+      ctx.lineTo(px, py + this.radius); ctx.lineTo(px - this.radius, py);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = COL.white; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = COL.white; circle(px - 3, py - 3, 2);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 7. OBSTACLES
+// ---------------------------------------------------------------------------
+class Obstacle {
+  constructor(difficultyT) {
+    const kinds = ["rock", "thorns", "pterodactyl", "rival"];
+    const weights = [40, 30, 15 + difficultyT * 25, 5 + difficultyT * 25];
+    this.kind = choiceWeighted(kinds, weights);
+    this.x = W + 60;
+    this.y = randRange(PLAY_ZONE.top + 20, PLAY_ZONE.bottom - 20);
+    this.baseY = this.y;
+    this.t = 0;
+    if (this.kind === "rock") { this.w = 34; this.h = 28; }
+    else if (this.kind === "thorns") { this.w = 40; this.h = 24; }
+    else if (this.kind === "pterodactyl") { this.w = 44; this.h = 30; }
+    else { this.w = 50; this.h = 40; this.extraSpeed = randRange(40, 90); }
+  }
+  update(dt, scrollSpeed) {
+    this.t += dt;
+    let speed = scrollSpeed;
+    if (this.kind === "rival") speed += this.extraSpeed;
+    this.x -= speed * dt;
+    if (this.kind === "pterodactyl") this.y = this.baseY + Math.sin(this.t * 3) * 40;
+    else if (this.kind === "rival") this.y = this.baseY + Math.sin(this.t * 5) * 14;
+  }
+  getRect() { return { x: this.x - this.w / 2, y: this.y - this.h / 2, w: this.w, h: this.h }; }
+  offScreen() { return this.x < -this.w * 2; }
+  draw() {
+    const px = this.x, py = this.y;
+    if (this.kind === "rock") {
+      ctx.fillStyle = "#827873";
+      ctx.beginPath();
+      ctx.moveTo(px - 17, py + 14); ctx.lineTo(px - 10, py - 12); ctx.lineTo(px + 6, py - 16);
+      ctx.lineTo(px + 17, py + 6); ctx.lineTo(px + 10, py + 14);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = "#5f5854"; ctx.lineWidth = 2; ctx.stroke();
+    } else if (this.kind === "thorns") {
+      ctx.fillStyle = "#4a5c3a"; ellipse(px, py + 6, 20, 10);
+      ctx.strokeStyle = "#283c1e"; ctx.lineWidth = 3;
+      for (let i = 0; i < 5; i++) {
+        const sx = px - 16 + i * 8;
+        ctx.beginPath(); ctx.moveTo(sx, py + 6); ctx.lineTo(sx + 3, py - 14); ctx.stroke();
+      }
+    } else if (this.kind === "pterodactyl") {
+      const flap = Math.sin(this.t * 14) * 14;
+      ctx.fillStyle = "#6e5a82";
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px - 26, py - 10 - flap); ctx.lineTo(px - 6, py + 4); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + 26, py - 10 - flap); ctx.lineTo(px + 6, py + 4); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "#967ba0"; circle(px, py, 8);
+      ctx.fillStyle = "#ffd23c"; circle(px + 5, py - 2, 2);
+    } else { // rival
+      ctx.fillStyle = "#d65a3c"; ellipse(px, py, 21, 14);
+      const headX = px - 22, headY = py - 10;
+      circle(headX, headY, 12);
+      ctx.fillStyle = COL.black; circle(headX - 4, headY - 2, 2);
+      ctx.fillStyle = "#d65a3c";
+      const legOff = Math.sin(this.t * 18) * 8;
+      ctx.strokeStyle = "#a03c28"; ctx.lineWidth = 5; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(px - 6, py + 10); ctx.lineTo(px - 6 + legOff, py + 22); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(px + 8, py + 10); ctx.lineTo(px + 8 - legOff, py + 22); ctx.stroke();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 8. HUD
+// ---------------------------------------------------------------------------
+function drawHearts(lives, maxLives, x, y) {
+  for (let i = 0; i < maxLives; i++) {
+    const cx = x + i * 30;
+    const filled = i < lives;
+    ctx.fillStyle = filled ? COL.heart : COL.heartEmpty;
+    circle(cx - 5, y, 7); circle(cx + 5, y, 7);
+    ctx.beginPath();
+    ctx.moveTo(cx - 11, y + 2); ctx.lineTo(cx + 11, y + 2); ctx.lineTo(cx, y + 15);
+    ctx.closePath(); ctx.fill();
+  }
+}
+
+function drawHUD(score, lives, maxLives, highScore) {
+  ctx.fillStyle = COL.panel;
+  ctx.fillRect(0, 0, W, 56);
+  drawText("SCORE", 14, COL.accent, 18, 16, { align: "topleft", bold: true });
+  drawText(String(score), 26, COL.text, 18, 32, { align: "topleft", bold: true });
+  drawText("BEST", 14, COL.accent, W / 2 - 40, 16, { align: "topleft", bold: true });
+  drawText(String(highScore), 26, COL.text, W / 2 - 40, 32, { align: "topleft", bold: true });
+  drawText("LIVES", 14, COL.accent, W - 150, 12, { align: "topleft", bold: true });
+  drawHearts(lives, maxLives, W - 145, 38);
+}
+
+// ---------------------------------------------------------------------------
+// 9. SCREENS
+// ---------------------------------------------------------------------------
+function drawStartScreen(t, highScore) {
+  const bob = Math.sin(t * 2) * 6;
+  drawText("DINO DASH", 64, COL.accent, W / 2, 170 + bob, { bold: true });
+  drawText("Chase the food. Dodge the danger.", 22, COL.text, W / 2, 225);
+
+  ctx.fillStyle = COL.panel;
+  ctx.fillRect(W / 2 - 260, 270, 520, 150);
+
+  drawText("ARROW KEYS / WASD  -  move", 20, COL.text, W / 2, 305);
+  drawText("Collect food for points, avoid obstacles!", 18, COL.text, W / 2, 335);
+
+  if (Math.floor(t * 2) % 2 === 0) {
+    drawText("PRESS SPACE TO START", 26, COL.accent, W / 2, 385, { bold: true });
+  }
+  drawText(`High Score: ${highScore}`, 20, COL.text, W / 2, 430);
+}
+
+function drawGameOverScreen(score, highScore, isNewRecord, t) {
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillRect(0, 0, W, H);
+
+  drawText("GAME OVER", 58, "#f05a5a", W / 2, 170, { bold: true });
+
+  if (isNewRecord) {
+    const pulse = 1 + Math.sin(t * 6) * 0.08;
+    drawText("NEW HIGH SCORE!", Math.round(24 * pulse), COL.accent, W / 2, 220, { bold: true });
+  }
+
+  drawText(`Score: ${score}`, 30, COL.text, W / 2, 270, { bold: true });
+  drawText(`Best: ${highScore}`, 22, COL.text, W / 2, 306);
+
+  if (Math.floor(t * 2) % 2 === 0) {
+    drawText("PRESS SPACE TO PLAY AGAIN", 24, COL.accent, W / 2, 370, { bold: true });
+  }
+  drawText("Esc to quit to start screen", 16, COL.text, W / 2, 405);
+}
+
+// ---------------------------------------------------------------------------
+// 10. GAME
+// ---------------------------------------------------------------------------
+class Game {
+  constructor() {
+    this.highScore = loadHighScore();
+    this.state = STATE_START;
+    this.stateTimer = 0;
+
+    this.background = new Background();
+    this.player = new Player();
+
+    this.keys = new Set();
+
+    this._resetRun();
+  }
+
+  _resetRun() {
+    this.score = 0;
+    this.lives = PLAYER_START_LIVES;
+    this.player.reset();
+
+    this.foods = [];
+    this.obstacles = [];
+    this.particles = [];
+
+    this.foodTimer = 0;
+    this.obstacleTimer = 0;
+    this.foodInterval = BASE_FOOD_INTERVAL;
+    this.obstacleInterval = BASE_OBSTACLE_INTERVAL;
+    this.scrollSpeed = BASE_SCROLL_SPEED;
+    this.newRecordThisRun = false;
+  }
+
+  _difficultyT() { return clamp(this.score / 500, 0, 1); }
+
+  _updateDifficulty() {
+    const t = this._difficultyT();
+    this.scrollSpeed = clamp(BASE_SCROLL_SPEED + this.score * SCROLL_SPEED_PER_SCORE, BASE_SCROLL_SPEED, MAX_SCROLL_SPEED);
+    this.foodInterval = Math.max(MIN_FOOD_INTERVAL, BASE_FOOD_INTERVAL - t * 0.7);
+    this.obstacleInterval = Math.max(MIN_OBSTACLE_INTERVAL, BASE_OBSTACLE_INTERVAL - t * 1.1);
+  }
+
+  startGame() { this._resetRun(); this.state = STATE_PLAYING; this.stateTimer = 0; }
+  backToStart() { this.state = STATE_START; this.stateTimer = 0; }
+
+  update(dt) {
+    this.stateTimer += dt;
+    this.background.update(dt, this.state === STATE_PLAYING ? this.scrollSpeed : BASE_SCROLL_SPEED * 0.4);
+
+    for (const p of this.particles) p.update(dt);
+    this.particles = this.particles.filter(p => !p.isDead());
+
+    if (this.state === STATE_PLAYING) this._updatePlaying(dt);
+  }
+
+  _updatePlaying(dt) {
+    this._updateDifficulty();
+
+    this.player.handleInput(this.keys, dt);
+    this.player.update(dt);
+
+    this.foodTimer += dt;
+    if (this.foodTimer >= this.foodInterval) { this.foodTimer = 0; this.foods.push(new Food()); }
+
+    this.obstacleTimer += dt;
+    if (this.obstacleTimer >= this.obstacleInterval) { this.obstacleTimer = 0; this.obstacles.push(new Obstacle(this._difficultyT())); }
+
+    for (const f of this.foods) f.update(dt, this.scrollSpeed);
+    for (const o of this.obstacles) o.update(dt, this.scrollSpeed);
+
+    const playerRect = this.player.getRect();
+
+    // Food collection
+    const remainingFood = [];
+    for (const f of this.foods) {
+      if (f.offScreen()) continue;
+      if (rectsOverlap(playerRect, f.getRect())) {
+        this.score += f.points;
+        spawnBurst(this.particles, f.x, f.y, f.color, 16);
+        continue;
+      }
+      remainingFood.push(f);
+    }
+    this.foods = remainingFood;
+
+    // Obstacle collisions
+    const remainingObstacles = [];
+    for (const o of this.obstacles) {
+      if (o.offScreen()) continue;
+      if (!this.player.isInvulnerable && rectsOverlap(playerRect, o.getRect())) {
+        this.lives -= 1;
+        this.player.hit();
+        spawnBurst(this.particles, this.player.x, this.player.y, "#e64646", 20);
+        if (this.lives <= 0) { this._endGame(); }
+      }
+      remainingObstacles.push(o);
+    }
+    this.obstacles = remainingObstacles;
+  }
+
+  _endGame() {
+    this.state = STATE_GAMEOVER;
+    this.stateTimer = 0;
+    if (this.score > this.highScore) {
+      this.highScore = this.score;
+      this.newRecordThisRun = true;
+      saveHighScore(this.highScore);
+    }
+  }
+
+  draw() {
+    this.background.draw();
+
+    if (this.state === STATE_PLAYING || this.state === STATE_GAMEOVER) {
+      for (const f of this.foods) f.draw();
+      for (const o of this.obstacles) o.draw();
+      this.player.draw();
+    }
+
+    for (const p of this.particles) p.draw();
+
+    if (this.state === STATE_PLAYING) {
+      drawHUD(this.score, this.lives, PLAYER_START_LIVES, this.highScore);
+    } else if (this.state === STATE_START) {
+      this.player.draw();
+      drawStartScreen(this.stateTimer, this.highScore);
+    } else if (this.state === STATE_GAMEOVER) {
+      drawHUD(this.score, this.lives, PLAYER_START_LIVES, this.highScore);
+      drawGameOverScreen(this.score, this.highScore, this.newRecordThisRun, this.stateTimer);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 11. INPUT WIRING & MAIN LOOP
+// ---------------------------------------------------------------------------
+const game = new Game();
+
+const MOVE_KEYS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "KeyW", "KeyA", "KeyS", "KeyD"]);
+
+window.addEventListener("keydown", (e) => {
+  if (MOVE_KEYS.has(e.code) || e.code === "Space" || e.code === "Enter" || e.code === "Escape") {
+    e.preventDefault();
+  }
+  game.keys.add(e.code);
+
+  if (e.code === "Space" || e.code === "Enter") {
+    if (game.state === STATE_START || game.state === STATE_GAMEOVER) game.startGame();
+  } else if (e.code === "Escape") {
+    if (game.state === STATE_PLAYING) game.backToStart();
+  }
+});
+window.addEventListener("keyup", (e) => { game.keys.delete(e.code); });
+
+// Touch controls: show the on-screen d-pad on touch-capable devices,
+// and let tapping the canvas start/restart the game.
+const touchpad = document.getElementById("touchpad");
+if ("ontouchstart" in window) touchpad.classList.add("show");
+
+function bindTouchButton(id, code) {
+  const el = document.getElementById(id);
+  const press = (e) => { e.preventDefault(); game.keys.add(code); };
+  const release = (e) => { e.preventDefault(); game.keys.delete(code); };
+  el.addEventListener("touchstart", press, { passive: false });
+  el.addEventListener("touchend", release, { passive: false });
+  el.addEventListener("touchcancel", release, { passive: false });
+  el.addEventListener("mousedown", press);
+  el.addEventListener("mouseup", release);
+  el.addEventListener("mouseleave", release);
+}
+bindTouchButton("tb-up", "ArrowUp");
+bindTouchButton("tb-down", "ArrowDown");
+bindTouchButton("tb-left", "ArrowLeft");
+bindTouchButton("tb-right", "ArrowRight");
+
+canvas.addEventListener("touchstart", () => {
+  if (game.state === STATE_START || game.state === STATE_GAMEOVER) game.startGame();
+}, { passive: true });
+canvas.addEventListener("click", () => {
+  if (game.state === STATE_START || game.state === STATE_GAMEOVER) game.startGame();
+});
+
+// Main loop
+let lastTime = performance.now();
+function loop(now) {
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  dt = Math.min(dt, 0.05); // avoid huge jumps if the tab was backgrounded
+
+  game.update(dt);
+  game.draw();
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
